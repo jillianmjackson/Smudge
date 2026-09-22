@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Smudged Glass</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #111;
+    overflow: hidden;
+    height: 100%;
+  }
+  canvas { display: block; }
+  #hint {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    transform: translateX(-50%);
+    color: rgba(255,255,255,0.75);
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    letter-spacing: 0.02em;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.6);
+    pointer-events: none;
+    transition: opacity 1s ease;
+  }
+  #hint.hidden { opacity: 0; }
+</style>
+</head>
+<body>
+<div id="hint">click and drag to wipe the fog away</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script>
+
+let video;
+let glassShader;
+let blurGfx;     // small, blurred copy of the video (the "fogged" look)
+let clarityGfx;  // grayscale mask: where the user has wiped the glass clear
+let noiseGfx;    // static tileable noise used for the glass distortion + grain
+
+const SCALE_DOWN = 4; // clarity/blur buffers are this much smaller than the canvas
+let bufW, bufH;
+let hintEl;
+let hasInteracted = false;
+
+const vertSrc = `
+precision highp float;
+attribute vec3 aPosition;
+attribute vec2 aTexCoord;
+varying vec2 vTexCoord;
+uniform mat4 uModelViewMatrix;
+uniform mat4 uProjectionMatrix;
+
+void main() {
+  vTexCoord = aTexCoord;
+  vec4 positionVec4 = vec4(aPosition, 1.0);
+  gl_Position = uProjectionMatrix * uModelViewMatrix * positionVec4;
+}
+`;
+
+const fragSrc = `
+precision highp float;
+varying vec2 vTexCoord;
+
+uniform sampler2D uSharp;
+uniform sampler2D uBlur;
+uniform sampler2D uClarity;
+uniform sampler2D uNoise;
+uniform float uTime;
+uniform vec2 uNoiseOffset;
+
+void main() {
+  vec2 uv = vTexCoord;
+
+  float clarity = texture2D(uClarity, uv).r;
+
+  // scrolling noise field bends the image like uneven glass; wiped areas distort less
+  vec2 noiseUV = fract(uv * 3.0 + uNoiseOffset);
+  vec2 n = texture2D(uNoise, noiseUV).rg - 0.5;
+  float distortAmt = mix(0.028, 0.003, clarity);
+  vec2 duv = uv + n * distortAmt;
+
+  vec3 sharpColor = texture2D(uSharp, duv).rgb;
+  vec3 blurColor  = texture2D(uBlur, duv).rgb;
+
+  vec3 col = mix(blurColor, sharpColor, clarity);
+
+  // cool, slightly milky tint over the fogged parts
+  vec3 fogTint = vec3(0.86, 0.90, 0.94);
+  float fogAmt = 1.0 - clarity;
+  col = mix(col, col * fogTint + 0.03 * fogAmt, fogAmt);
+
+  // soft vignette
+  vec2 centered = vTexCoord - 0.5;
+  float vig = smoothstep(0.9, 0.25, length(centered));
+  col *= mix(0.72, 1.0, vig);
+
+  // fine grain so the fog doesn't look flat
+  float grain = texture2D(uNoise, uv * 9.0 + uTime * 0.015).r;
+  col += (grain - 0.5) * 0.035;
+
+  gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+function setup() {
+  createCanvas(windowWidth, windowHeight, WEBGL);
+  noStroke();
+
+  video = createCapture(VIDEO, () => {});
+  video.size(640, 480);
+  video.hide();
+
+  bufW = floor(width / SCALE_DOWN);
+  bufH = floor(height / SCALE_DOWN);
+
+  blurGfx = createGraphics(bufW, bufH);
+  clarityGfx = createGraphics(bufW, bufH);
+  clarityGfx.pixelDensity(1);
+  clarityGfx.background(0);
+
+  noiseGfx = createGraphics(256, 256);
+  noiseGfx.pixelDensity(1);
+  noiseGfx.loadPixels();
+  noiseDetail(4, 0.5);
+  for (let y = 0; y < noiseGfx.height; y++) {
+    for (let x = 0; x < noiseGfx.width; x++) {
+      const i = (x + y * noiseGfx.width) * 4;
+      const r = noise(x * 0.05, y * 0.05) * 255;
+      const g = noise(x * 0.05 + 500, y * 0.05 + 500) * 255;
+      noiseGfx.pixels[i] = r;
+      noiseGfx.pixels[i + 1] = g;
+      noiseGfx.pixels[i + 2] = 0;
+      noiseGfx.pixels[i + 3] = 255;
+    }
+  }
+  noiseGfx.updatePixels();
+
+  glassShader = createShader(vertSrc, fragSrc);
+  hintEl = select('#hint');
+}
+
+function draw() {
+  background(0);
+
+  if (video.width > 0) {
+    blurGfx.image(video, 0, 0, bufW, bufH);
+    blurGfx.filter(BLUR, 3);
+  }
+
+  // fog slowly regrows over any wiped-clear streaks
+  clarityGfx.push();
+  clarityGfx.noStroke();
+  clarityGfx.fill(0, 3);
+  clarityGfx.rect(0, 0, bufW, bufH);
+  clarityGfx.pop();
+
+  if (mouseIsPressed && mouseY > 0) {
+    if (!hasInteracted) {
+      hasInteracted = true;
+      hintEl.addClass('hidden');
+    }
+    const mx = map(mouseX, 0, width, 0, bufW);
+    const my = map(mouseY, 0, height, 0, bufH);
+    const pmx = map(pmouseX, 0, width, 0, bufW);
+    const pmy = map(pmouseY, 0, height, 0, bufH);
+    clarityGfx.push();
+    clarityGfx.stroke(255, 60);
+    clarityGfx.strokeWeight(bufH * 0.16);
+    clarityGfx.strokeCap(ROUND);
+    clarityGfx.line(pmx, pmy, mx, my);
+    clarityGfx.pop();
+  }
+
+  shader(glassShader);
+  glassShader.setUniform('uSharp', video);
+  glassShader.setUniform('uBlur', blurGfx);
+  glassShader.setUniform('uClarity', clarityGfx);
+  glassShader.setUniform('uNoise', noiseGfx);
+  glassShader.setUniform('uTime', millis() / 1000.0);
+  glassShader.setUniform('uNoiseOffset', [millis() * 0.00002, millis() * 0.000015]);
+
+  rect(-width / 2, -height / 2, width, height);
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  bufW = floor(width / SCALE_DOWN);
+  bufH = floor(height / SCALE_DOWN);
+  blurGfx = createGraphics(bufW, bufH);
+  const oldClarity = clarityGfx;
+  clarityGfx = createGraphics(bufW, bufH);
+  clarityGfx.pixelDensity(1);
+  clarityGfx.background(0);
+  clarityGfx.image(oldClarity, 0, 0, bufW, bufH);
+}
+</script>
+</body>
+</html>
