@@ -12,16 +12,24 @@
     height: 100%;
   }
   canvas { display: block; }
+  #overlay {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain; /* must match the fit math in fitRect() */
+    pointer-events: none;
+  }
   #hint {
     position: fixed;
     left: 50%;
     bottom: 28px;
     transform: translateX(-50%);
     color: rgba(255,255,255,0.75);
+    text-shadow: 0 1px 4px rgba(0,0,0,0.6);
     font-family: -apple-system, "Segoe UI", sans-serif;
     font-size: 14px;
     letter-spacing: 0.02em;
-    text-shadow: 0 1px 4px rgba(0,0,0,0.6);
     pointer-events: none;
     transition: opacity 1s ease;
   }
@@ -29,7 +37,8 @@
 </style>
 </head>
 <body>
-<div id="hint">click and drag to wipe the fog away</div>
+<img id="overlay" alt="" />
+<div id="hint">click or press space to try another frame</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
 <script>
 
@@ -43,6 +52,23 @@ const SCALE_DOWN = 4; // clarity/blur buffers are this much smaller than the can
 let bufW, bufH;
 let hintEl;
 let hasInteracted = false;
+
+// glasses overlays, drawn as an <img> on top of the canvas. The camera only
+// shows through each frame's lenses, found by flood-filling the SVG's alpha.
+const FRAME_FILES = [
+  'assets/MacBook Pro 16_ - 3.svg',
+  'assets/MacBook Pro 16_ - 4.svg',
+  'assets/MacBook Pro 16_ - 5.svg',
+  'assets/MacBook Pro 16_ - 6.svg',
+];
+const ALPHA_WALL = 24;        // pixels at least this opaque count as frame
+const MIN_LENS_RATIO = 0.25;  // enclosed regions smaller than this x the biggest one aren't lenses
+                              // (letter holes in the caption, the gap in an aviator's double bridge)
+let frames = [];              // { url, w, h, lens: p5.Graphics | null, failed }
+let noLens;                   // black placeholder while a mask is still loading
+let frameIndex = 0;
+let overlayEl;
+let pressX = 0, pressY = 0;
 
 const vertSrc = `
 precision highp float;
@@ -69,6 +95,9 @@ uniform sampler2D uClarity;
 uniform sampler2D uNoise;
 uniform float uTime;
 uniform vec2 uNoiseOffset;
+uniform sampler2D uLens;
+uniform float uHasLens;
+uniform vec4 uFit; // overlay rect in screen uv: xy = offset, zw = size
 
 void main() {
   vec2 uv = vTexCoord;
@@ -100,7 +129,14 @@ void main() {
   float grain = texture2D(uNoise, uv * 9.0 + uTime * 0.015).r;
   col += (grain - 0.5) * 0.035;
 
-  gl_FragColor = vec4(col, 1.0);
+  // smudged glass inside the lenses, the plain camera feed everywhere else
+  vec2 luv = (vTexCoord - uFit.xy) / uFit.zw;
+  float inBounds = step(0.0, luv.x) * step(luv.x, 1.0) * step(0.0, luv.y) * step(luv.y, 1.0);
+  float lens = smoothstep(0.02, 0.3, texture2D(uLens, clamp(luv, 0.0, 1.0)).r) * inBounds;
+  lens = mix(1.0, lens, uHasLens);
+
+  vec3 clearView = texture2D(uSharp, uv).rgb;
+  gl_FragColor = vec4(mix(clearView, col, lens), 1.0);
 }
 `;
 
@@ -139,6 +175,127 @@ function setup() {
 
   glassShader = createShader(vertSrc, fragSrc);
   hintEl = select('#hint');
+  overlayEl = document.getElementById('overlay');
+  noLens = createGraphics(1, 1);
+  noLens.background(0);
+
+  frames = FRAME_FILES.map(f => ({ url: encodeURI(f), w: 1728, h: 1117, lens: null }));
+  showFrame(0);
+  frames.forEach(fr => {
+    const img = new Image();
+    img.onload = () => {
+      fr.w = img.naturalWidth || fr.w;
+      fr.h = img.naturalHeight || fr.h;
+      try {
+        fr.lens = buildLensMask(img, fr.w, fr.h);
+      } catch (e) {
+        // file:// pages can't read image pixels; serve the folder (e.g. Live Server) instead
+        console.warn('Could not build lens mask for', fr.url, e);
+        fr.failed = true;
+      }
+    };
+    img.src = fr.url;
+  });
+}
+
+// Everything transparent that can be reached from the image border is "outside".
+// Transparent pixels the flood can't reach are enclosed by the frame: the lenses.
+function buildLensMask(img, w, h) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+  const px = ctx.getImageData(0, 0, w, h);
+  const alpha = px.data;
+  const n = w * h;
+  const open = new Uint8Array(n);
+  for (let i = 0; i < n; i++) open[i] = alpha[i * 4 + 3] < ALPHA_WALL ? 1 : 0;
+
+  // 0 = unvisited, 1 = outside, 2+ = enclosed region id
+  const label = new Int32Array(n);
+  const stack = new Int32Array(n);
+
+  const fill = (seeds, seedCount, value) => {
+    let sp = 0, count = 0;
+    for (let s = 0; s < seedCount; s++) {
+      const i = seeds[s];
+      if (open[i] && !label[i]) { label[i] = value; stack[sp++] = i; }
+    }
+    while (sp > 0) {
+      const i = stack[--sp];
+      count++;
+      const x = i % w;
+      if (x > 0 && open[i - 1] && !label[i - 1]) { label[i - 1] = value; stack[sp++] = i - 1; }
+      if (x < w - 1 && open[i + 1] && !label[i + 1]) { label[i + 1] = value; stack[sp++] = i + 1; }
+      if (i >= w && open[i - w] && !label[i - w]) { label[i - w] = value; stack[sp++] = i - w; }
+      if (i < n - w && open[i + w] && !label[i + w]) { label[i + w] = value; stack[sp++] = i + w; }
+    }
+    return count;
+  };
+
+  const border = [];
+  for (let x = 0; x < w; x++) border.push(x, n - w + x);
+  for (let y = 0; y < h; y++) border.push(y * w, y * w + w - 1);
+  fill(border, border.length, 1);
+
+  const areas = [0, 0];
+  for (let i = 0; i < n; i++) {
+    if (!open[i] || label[i]) continue;
+    areas.push(fill([i], 1, areas.length));
+  }
+  const minArea = Math.max(...areas) * MIN_LENS_RATIO;
+
+  for (let i = 0; i < n; i++) {
+    const v = label[i] >= 2 && areas[label[i]] >= minArea ? 255 : 0;
+    alpha[i * 4] = alpha[i * 4 + 1] = alpha[i * 4 + 2] = v;
+    alpha[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(px, 0, 0);
+
+  // blur so the mask (after the shader's smoothstep) tucks slightly under the frame
+  const g = createGraphics(w, h);
+  g.pixelDensity(1);
+  g.drawingContext.filter = 'blur(8px)';
+  g.drawingContext.drawImage(c, 0, 0);
+  g.drawingContext.filter = 'none';
+  return g;
+}
+
+function showFrame(i) {
+  frameIndex = (i + frames.length) % frames.length;
+  overlayEl.src = frames[frameIndex].url;
+  clarityGfx.background(0); // fresh glasses, fresh smudges
+}
+
+// the overlay rect in screen uv, matching the <img>'s object-fit: contain
+function fitRect(fr) {
+  const s = min(width / fr.w, height / fr.h);
+  const dw = fr.w * s, dh = fr.h * s;
+  return [(width - dw) / 2 / width, (height - dh) / 2 / height, dw / width, dh / height];
+}
+
+function mousePressed() {
+  pressX = mouseX;
+  pressY = mouseY;
+}
+
+// a click (no real drag) switches frames; dragging still wipes
+function mouseReleased() {
+  if (dist(pressX, pressY, mouseX, mouseY) < 6) {
+    showFrame(frameIndex + 1);
+    if (!hasInteracted) {
+      hasInteracted = true;
+      hintEl.addClass('hidden');
+    }
+  }
+}
+
+function keyPressed() {
+  if (key === ' ') {
+    showFrame(frameIndex + 1);
+    return false;
+  }
 }
 
 function draw() {
@@ -180,6 +337,10 @@ function draw() {
   glassShader.setUniform('uNoise', noiseGfx);
   glassShader.setUniform('uTime', millis() / 1000.0);
   glassShader.setUniform('uNoiseOffset', [millis() * 0.00002, millis() * 0.000015]);
+  const fr = frames[frameIndex];
+  glassShader.setUniform('uLens', fr.lens || noLens);
+  glassShader.setUniform('uHasLens', fr.failed ? 0.0 : 1.0); // no mask at all: show camera everywhere
+  glassShader.setUniform('uFit', fitRect(fr));
 
   rect(-width / 2, -height / 2, width, height);
 }
