@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Smudged Glass</title>
 <style>
   html, body {
@@ -10,10 +11,18 @@
     background: #111;
     overflow: hidden;
     height: 100%;
+    touch-action: none; /* dragging wipes the glass instead of scrolling/zooming */
   }
   canvas { display: block; }
-  #overlay {
+  /* everything that turns with the phone; layoutStage() sizes and rotates it */
+  #stage {
     position: fixed;
+    top: 0;
+    left: 0;
+    transform-origin: 0 0;
+  }
+  #overlay {
+    position: absolute;
     inset: 0;
     width: 100%;
     height: 100%;
@@ -21,7 +30,7 @@
     pointer-events: none;
   }
   #hint {
-    position: fixed;
+    position: absolute;
     left: 50%;
     bottom: 28px;
     transform: translateX(-50%);
@@ -34,11 +43,32 @@
     transition: opacity 1s ease;
   }
   #hint.hidden { opacity: 0; }
+  #turn-note {
+    display: none;
+    position: fixed;
+    top: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    padding: 10px 18px;
+    border-radius: 999px;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    font-size: 15px;
+    white-space: nowrap;
+    pointer-events: none;
+    transition: opacity 1s ease;
+  }
+  body.rotated #turn-note { display: block; }
+  #turn-note.hidden { opacity: 0; }
 </style>
 </head>
 <body>
-<img id="overlay" alt="" />
-<div id="hint">click or press space to try another frame</div>
+<div id="stage">
+  <img id="overlay" alt="" />
+  <div id="hint">click or press space to try another frame</div>
+</div>
+<div id="turn-note">&#x27F2; turn your phone sideways</div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
 <script>
 
@@ -70,6 +100,15 @@ let frameIndex = 0;
 let overlayEl;
 let pressX = 0, pressY = 0;
 
+// Phones held upright get the whole stage turned 90deg, so the landscape
+// layout fills the screen once the phone is turned sideways (even with
+// rotation lock on). The camera isn't turned: it already matches the screen.
+const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches;
+let rotated = false;
+let stageW, stageH;
+let stageEl, turnNoteEl;
+let px = 0, py = 0, ppx = 0, ppy = 0; // pointer in stage coords, this and last frame
+
 const vertSrc = `
 precision highp float;
 attribute vec3 aPosition;
@@ -97,7 +136,13 @@ uniform float uTime;
 uniform vec2 uNoiseOffset;
 uniform sampler2D uLens;
 uniform float uHasLens;
-uniform vec4 uFit; // overlay rect in screen uv: xy = offset, zw = size
+uniform vec4 uFit; // overlay rect in stage uv: xy = offset, zw = size
+uniform float uRotated;
+
+// stage uv -> camera uv. The stage may be turned 90deg on screen; the camera never is.
+vec2 camUV(vec2 st) {
+  return mix(st, vec2(1.0 - st.y, st.x), uRotated);
+}
 
 void main() {
   vec2 uv = vTexCoord;
@@ -110,8 +155,8 @@ void main() {
   float distortAmt = mix(0.028, 0.003, clarity);
   vec2 duv = uv + n * distortAmt;
 
-  vec3 sharpColor = texture2D(uSharp, duv).rgb;
-  vec3 blurColor  = texture2D(uBlur, duv).rgb;
+  vec3 sharpColor = texture2D(uSharp, camUV(duv)).rgb;
+  vec3 blurColor  = texture2D(uBlur, camUV(duv)).rgb;
 
   vec3 col = mix(blurColor, sharpColor, clarity);
 
@@ -135,13 +180,38 @@ void main() {
   float lens = smoothstep(0.02, 0.3, texture2D(uLens, clamp(luv, 0.0, 1.0)).r) * inBounds;
   lens = mix(1.0, lens, uHasLens);
 
-  vec3 clearView = texture2D(uSharp, uv).rgb;
+  vec3 clearView = texture2D(uSharp, camUV(uv)).rgb;
   gl_FragColor = vec4(mix(clearView, col, lens), 1.0);
 }
 `;
 
+// the stage is the screen, or the screen turned sideways on an upright phone
+function layoutStage() {
+  rotated = IS_TOUCH && windowHeight > windowWidth;
+  stageW = rotated ? windowHeight : windowWidth;
+  stageH = rotated ? windowWidth : windowHeight;
+  stageEl.style.width = stageW + 'px';
+  stageEl.style.height = stageH + 'px';
+  stageEl.style.transform = rotated ? `translateX(${windowWidth}px) rotate(90deg)` : 'none';
+  document.body.classList.toggle('rotated', rotated);
+}
+
+// window coords -> stage coords (undoes the 90deg turn)
+function updatePointer() {
+  ppx = px;
+  ppy = py;
+  px = rotated ? winMouseY : winMouseX;
+  py = rotated ? windowWidth - winMouseX : winMouseY;
+}
+
 function setup() {
-  createCanvas(windowWidth, windowHeight, WEBGL);
+  stageEl = document.getElementById('stage');
+  turnNoteEl = document.getElementById('turn-note');
+  layoutStage();
+  pixelDensity(min(2, displayDensity()));
+  const cnv = createCanvas(stageW, stageH, WEBGL);
+  cnv.parent(stageEl);
+  stageEl.insertBefore(cnv.elt, stageEl.firstChild); // keep the canvas under the overlay
   noStroke();
 
   video = createCapture(VIDEO, () => {});
@@ -175,6 +245,7 @@ function setup() {
 
   glassShader = createShader(vertSrc, fragSrc);
   hintEl = select('#hint');
+  if (IS_TOUCH) hintEl.html('tap to try another frame');
   overlayEl = document.getElementById('overlay');
   noLens = createGraphics(1, 1);
   noLens.background(0);
@@ -275,20 +346,32 @@ function fitRect(fr) {
   return [(width - dw) / 2 / width, (height - dh) / 2 / height, dw / width, dh / height];
 }
 
+function markInteracted() {
+  if (hasInteracted) return;
+  hasInteracted = true;
+  hintEl.addClass('hidden');
+  turnNoteEl.classList.add('hidden');
+}
+
 function mousePressed() {
-  pressX = mouseX;
-  pressY = mouseY;
+  updatePointer();
+  ppx = px;
+  ppy = py; // don't streak from wherever the last touch ended
+  pressX = px;
+  pressY = py;
 }
 
 // a click (no real drag) switches frames; dragging still wipes
 function mouseReleased() {
-  if (dist(pressX, pressY, mouseX, mouseY) < 6) {
+  updatePointer();
+  if (dist(pressX, pressY, px, py) < 10) {
     showFrame(frameIndex + 1);
-    if (!hasInteracted) {
-      hasInteracted = true;
-      hintEl.addClass('hidden');
-    }
+    markInteracted();
   }
+}
+
+function touchMoved() {
+  return false; // no page scrolling while wiping
 }
 
 function keyPressed() {
@@ -313,15 +396,13 @@ function draw() {
   clarityGfx.rect(0, 0, bufW, bufH);
   clarityGfx.pop();
 
-  if (mouseIsPressed && mouseY > 0) {
-    if (!hasInteracted) {
-      hasInteracted = true;
-      hintEl.addClass('hidden');
-    }
-    const mx = map(mouseX, 0, width, 0, bufW);
-    const my = map(mouseY, 0, height, 0, bufH);
-    const pmx = map(pmouseX, 0, width, 0, bufW);
-    const pmy = map(pmouseY, 0, height, 0, bufH);
+  updatePointer();
+  if (mouseIsPressed && py > 0) {
+    markInteracted();
+    const mx = map(px, 0, width, 0, bufW);
+    const my = map(py, 0, height, 0, bufH);
+    const pmx = map(ppx, 0, width, 0, bufW);
+    const pmy = map(ppy, 0, height, 0, bufH);
     clarityGfx.push();
     clarityGfx.stroke(255, 60);
     clarityGfx.strokeWeight(bufH * 0.16);
@@ -341,12 +422,14 @@ function draw() {
   glassShader.setUniform('uLens', fr.lens || noLens);
   glassShader.setUniform('uHasLens', fr.failed ? 0.0 : 1.0); // no mask at all: show camera everywhere
   glassShader.setUniform('uFit', fitRect(fr));
+  glassShader.setUniform('uRotated', rotated ? 1.0 : 0.0);
 
   rect(-width / 2, -height / 2, width, height);
 }
 
 function windowResized() {
-  resizeCanvas(windowWidth, windowHeight);
+  layoutStage();
+  resizeCanvas(stageW, stageH);
   bufW = floor(width / SCALE_DOWN);
   bufH = floor(height / SCALE_DOWN);
   blurGfx = createGraphics(bufW, bufH);
